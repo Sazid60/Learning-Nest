@@ -532,7 +532,7 @@ async getTodos(
   return this.todoService.findAll(options);
 }
 ```
-
+![alt text](image.png)
 ---
 
 ## 4. Step-by-Step Construction of the Miniature Todo App
