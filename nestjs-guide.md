@@ -116,7 +116,7 @@ Choose `npm` as the package manager when prompted.
 ### 2.2 Installing Relational & Auxiliary Dependencies
 Next, install the exact packages needed to mirror Eventra's functionality (JWT, validation, files, mail, rate limiting, and database ORM):
 ```bash
-npm install @prisma/client @nestjs/jwt @nestjs/config @nestjs/throttler @nestjs/mapped-types bcrypt class-validator class-transformer cookie-parser cloudinary multer nodemailer ejs rxjs
+npm install @prisma/client @nestjs/jwt @nestjs/config @nestjs/throttler @nestjs/mapped-types bcrypt zod cookie-parser cloudinary multer nodemailer ejs rxjs
 npm install --save-dev prisma ts-node typescript @types/node @types/express @types/bcrypt @types/cookie-parser @types/multer @types/nodemailer supertest @types/supertest
 ```
 
@@ -204,7 +204,7 @@ Before writing code, let's look at how the file structures translate:
 | **Feature Routes** | `src/app/routes/index.ts` | Controllers | `@Controller('path')` |
 | **HTTP Action Route** | `router.post('/login', handler)` | Controller Method | `@Post('login')`, `@Get()`, `@Delete()` |
 | **JWT verification** | `src/app/middlewares/auth.ts` | Guards | `@UseGuards(JwtAuthGuard)` |
-| **Request Schema Validation**| Zod schemas in middleware | Pipes & DTO classes | `@UsePipes(new ValidationPipe())` |
+| **Request Schema Validation**| Zod schemas in middleware | Pipes & custom validation | `@UsePipes(new ZodValidationPipe(schema))` |
 | **Central Database Instance**| `src/prisma.ts` | PrismaService | Injectable Service module |
 | **Error Handlers** | `globalErrorHandler.ts` | Exception Filters | `@Catch(HttpException)` |
 | **Response Formatter** | `sendResponse.ts` | Interceptors | `@UseInterceptors(TransformInterceptor)` |
@@ -226,9 +226,9 @@ Before writing code, let's look at how the file structures translate:
       return value;
     };
     ```
-    In NestJS, we handle this declaratively using `class-validator` rules. This guarantees the application fails to compile/run immediately if environment configuration criteria are not met, saving you from runtime errors later.
+    In NestJS, we handle this declaratively using **Zod** schema validations. This guarantees the application fails to compile/run immediately if environment configuration criteria are not met, saving you from runtime errors later.
 *   **How is it used?**
-    By defining an environment variables DTO class, running `validateSync` on startup, and passing it to `ConfigModule.forRoot`:
+    By defining an environment validation schema using Zod, parsing the configuration, and passing it to `ConfigModule.forRoot`:
 
 In your Eventra-Backend, you use a custom helper function `requireEnv` inside `src/config/index.ts` to assert that all environment variables are present when the Node process starts:
 ```typescript
@@ -241,51 +241,31 @@ const requireEnv = (name: string): string => {
 };
 ```
 
-In NestJS, this is handled declaratively using **`@nestjs/config`**'s custom configuration validation function.
+In NestJS, this is handled declaratively using **`@nestjs/config`**'s custom configuration validation function combined with Zod schemas.
 
 #### Step 1: Create a Validation Function
 Create a validation file that checks the process environment variables:
 
 ```typescript
 // src/config/env.validation.ts
-import { plainToInstance } from 'class-transformer';
-import { IsEnum, IsNotEmpty, IsNumber, IsString, validateSync } from 'class-validator';
+import { z } from 'zod';
 
-enum Environment {
-  Development = 'development',
-  Production = 'production',
-  Test = 'test',
-}
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'production', 'test']),
+  PORT: z.coerce.number().default(3000),
+  DATABASE_URL: z.string().url(),
+  JWT_SECRET: z.string().min(1),
+});
 
-class EnvironmentVariables {
-  @IsEnum(Environment)
-  NODE_ENV: Environment;
-
-  @IsNumber()
-  PORT: number;
-
-  @IsString()
-  @IsNotEmpty()
-  DATABASE_URL: string;
-
-  @IsString()
-  @IsNotEmpty()
-  JWT_SECRET: string;
-}
+export type Env = z.infer<typeof envSchema>;
 
 export function validateEnv(config: Record<string, any>) {
-  const validatedConfig = plainToInstance(
-    EnvironmentVariables,
-    config,
-    { enableImplicitConversion: true } // Converts string numbers/booleans to JS numbers/booleans
-  );
-  
-  const errors = validateSync(validatedConfig, { skipMissingProperties: false });
+  const result = envSchema.safeParse(config);
 
-  if (errors.length > 0) {
-    throw new Error(`Startup Config Validation Error: \n${errors.toString()}`);
+  if (!result.success) {
+    throw new Error(`Startup Config Validation Error: \n${result.error.toString()}`);
   }
-  return validatedConfig;
+  return result.data;
 }
 ```
 
@@ -308,7 +288,7 @@ import { validateEnv } from './config/env.validation';
 })
 export class AppModule {}
 ```
-If any variables declared in the `EnvironmentVariables` validator class are missing or incorrect, NestJS will throw an assertion error on startup, preventing the server from listening on an invalid configuration state.
+If any variables declared in the `envSchema` are missing or incorrect, NestJS will throw an assertion error on startup, preventing the server from listening on an invalid configuration state.
 
 ---
 
@@ -461,45 +441,34 @@ export class PrismaModule {}
 ### 4.3 Authentication Module (JWT, Cookies, Roles)
 Let's build a authentication module that handles user registration, JWT token generation, password hashing, and cookie injection.
 
-#### Step 1: Create the User Register & Login DTOs (Data Transfer Objects)
-DTOs act as structural blueprints to validate client request bodies.
+#### Step 1: Create the User Register & Login Schemas & DTOs
+DTOs act as structural blueprints to validate client request bodies. Using Zod, we define schemas and infer types for direct request validation.
 
 ```typescript
 // src/modules/auth/dto/register.dto.ts
-import { IsEmail, IsNotEmpty, IsString, MinLength, IsEnum, IsOptional } from 'class-validator';
+import { z } from 'zod';
 import { Role } from '@prisma/client';
 
-export class RegisterDto {
-  @IsEmail({}, { message: 'Please provide a valid email address.' })
-  @IsNotEmpty()
-  email: string;
+export const registerSchema = z.object({
+  email: z.string().email('Please provide a valid email address.'),
+  name: z.string().min(1, 'Name is required.'),
+  password: z.string().min(6, 'Password must be at least 6 characters long.'),
+  role: z.nativeEnum(Role).optional(),
+});
 
-  @IsString()
-  @IsNotEmpty()
-  name: string;
-
-  @IsString()
-  @MinLength(6, { message: 'Password must be at least 6 characters long.' })
-  password: string;
-
-  @IsOptional()
-  @IsEnum(Role)
-  role?: Role;
-}
+export type RegisterDto = z.infer<typeof registerSchema>;
 ```
 
 ```typescript
 // src/modules/auth/dto/login.dto.ts
-import { IsEmail, IsNotEmpty, IsString } from 'class-validator';
+import { z } from 'zod';
 
-export class LoginDto {
-  @IsEmail()
-  email: string;
+export const loginSchema = z.object({
+  email: z.string().email('Please provide a valid email address.'),
+  password: z.string().min(1, 'Password is required.'),
+});
 
-  @IsString()
-  @IsNotEmpty()
-  password: string;
-}
+export type LoginDto = z.infer<typeof loginSchema>;
 ```
 
 #### Step 2: Implement the Authentication Service
@@ -587,14 +556,15 @@ export class AuthService {
 ```
 
 #### Step 3: Implement the Authentication Controller
-This controller exposes authentication routes and injects JWT access tokens directly into HTTP-only cookies.
+This controller exposes authentication routes and injects JWT access tokens directly into HTTP-only cookies. We use the `@UsePipes()` decorator and a custom `ZodValidationPipe` to validate incoming requests.
 
 ```typescript
 // src/modules/auth/auth.controller.ts
-import { Controller, Post, Body, Res, HttpCode, HttpStatus } from '@nestjs/common';
+import { Controller, Post, Body, Res, HttpCode, HttpStatus, UsePipes } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { RegisterDto } from './dto/register.dto';
-import { LoginDto } from './dto/login.dto';
+import { RegisterDto, registerSchema } from './dto/register.dto';
+import { LoginDto, loginSchema } from './dto/login.dto';
+import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { Response } from 'express';
 
 @Controller('api/v1/auth')
@@ -602,12 +572,14 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Post('register')
+  @UsePipes(new ZodValidationPipe(registerSchema))
   async register(@Body() dto: RegisterDto) {
     return this.authService.register(dto);
   }
 
   @Post('login')
   @HttpCode(HttpStatus.OK)
+  @UsePipes(new ZodValidationPipe(loginSchema))
   async login(
     @Body() dto: LoginDto,
     @Res({ passthrough: true }) response: Response, // { passthrough: true } lets Nest automatically serialize returned values
@@ -855,11 +827,11 @@ export const CurrentUser = createParamDecorator(
 *   **What is it?**
     A pipe is an injectable helper class implementing the `PipeTransform` interface. It operates on the arguments (parameters) of a controller route handler method.
 *   **Why is it used?**
-    In Express, incoming params are string types by default, and body parsing/validation is handled manually inside controllers or via route middlewares. NestJS Pipes run immediately before the handler method is executed. They perform two key tasks:
+    In Express, incoming params are string types by default, and body parsing/validation is handled manually inside controllers or via route middlewares (like Eventra's Zod parse). NestJS Pipes run immediately before the handler method is executed. They perform two key tasks:
     1.  **Transformation**: Mapping input strings/objects to their expected JavaScript types (e.g. converting string IDs to `BigInt`).
-    2.  **Validation**: Inspecting payloads against defined rules (using `class-validator` rules inside DTOs) and automatically throwing HTTP 400 Bad Request if validation rules fail, preventing execution from ever reaching your service.
+    2.  **Validation**: Inspecting payloads against defined schemas (using Zod schemas) and automatically throwing HTTP 400 Bad Request if validation rules fail, preventing execution from ever reaching your service.
 *   **How is it used?**
-    You apply them directly to route handler parameters or globally:
+    You apply them directly to route parameters or handlers using decorators:
 
 #### 4.6.1 ParseBigIntPipe
 Since PostgreSQL uses `BIGINT` for its primary key IDs, this custom pipe parses route parameter strings into JavaScript `bigint` types.
@@ -880,19 +852,36 @@ export class ParseBigIntPipe implements PipeTransform<string, bigint> {
 }
 ```
 
-#### 4.5.2 Applying Global Pipes
-To enforce request validation across your entire application using `class-validator` annotations in your DTOs, configure a global validation pipe in `src/main.ts`:
+#### 4.6.2 Custom ZodValidationPipe
+To validate request bodies and parameters against Zod schemas, we write a custom `ZodValidationPipe` that parses incoming payloads:
 
 ```typescript
-// src/main.ts (Validation Integration)
-import { ValidationPipe } from '@nestjs/common';
+// src/common/pipes/zod-validation.pipe.ts
+import { PipeTransform, Injectable, ArgumentMetadata, BadRequestException } from '@nestjs/common';
+import { ZodSchema } from 'zod';
 
-app.useGlobalPipes(
-  new ValidationPipe({
-    whitelist: true, // Strips away properties not defined in the DTO
-    transform: true, // Automatically transforms input payloads to match DTO types
-  })
-);
+@Injectable()
+export class ZodValidationPipe implements PipeTransform {
+  constructor(private schema: ZodSchema) {}
+
+  transform(value: unknown, metadata: ArgumentMetadata) {
+    const result = this.schema.safeParse(value);
+    if (!result.success) {
+      throw new BadRequestException({
+        message: 'Request validation failed',
+        errors: result.error.errors, // Format matching standard Zod error structures
+      });
+    }
+    return result.data;
+  }
+}
+```
+
+To apply it, pass the schema to the pipe inside the `@UsePipes()` decorator on your controller handler:
+```typescript
+@Post('endpoint')
+@UsePipes(new ZodValidationPipe(someSchema))
+async handleRequest(@Body() dto: SomeDto) { ... }
 ```
 
 ---
@@ -1129,39 +1118,30 @@ export class GlobalExceptionFilter implements ExceptionFilter {
 ### 4.9 Todo Module: Implementing Advanced Features
 Now, let's combine these concepts to build the Todo module. We will implement CRUD operations, user isolation, relational migrations, aggregations, and automatic transaction rollbacks.
 
-#### 4.9.1 DTO Definitions
+#### 4.9.1 DTO & Schema Definitions
 ```typescript
 // src/modules/todo/dto/create-todo.dto.ts
-import { IsNotEmpty, IsString, IsOptional, IsDateString } from 'class-validator';
+import { z } from 'zod';
 
-export class CreateTodoDto {
-  @IsString()
-  @IsNotEmpty()
-  title: string;
+export const createTodoSchema = z.object({
+  title: z.string().min(1, 'Title is required.'),
+  assigneeId: z.string().optional(), // String type from JSON, parsed to BigInt inside the service
+  dueDate: z.string().datetime().optional(),
+});
 
-  @IsOptional()
-  @IsString()
-  assigneeId?: string; // String type from JSON, parsed to BigInt inside the service
-
-  @IsOptional()
-  @IsDateString()
-  dueDate?: string;
-}
+export type CreateTodoDto = z.infer<typeof createTodoSchema>;
 ```
 
 ```typescript
 // src/modules/todo/dto/create-list.dto.ts
-import { IsNotEmpty, IsString, IsOptional } from 'class-validator';
+import { z } from 'zod';
 
-export class CreateListDto {
-  @IsString()
-  @IsNotEmpty()
-  title: string;
+export const createListSchema = z.object({
+  title: z.string().min(1, 'Title is required.'),
+  description: z.string().optional(),
+});
 
-  @IsOptional()
-  @IsString()
-  description?: string;
-}
+export type CreateListDto = z.infer<typeof createListSchema>;
 ```
 
 ---
@@ -1380,15 +1360,16 @@ This controller exposes API endpoints, applies security guards, reads user conte
 
 ```typescript
 // src/modules/todo/todo.controller.ts
-import { Controller, Post, Get, Patch, Body, Param, UseGuards } from '@nestjs/common';
+import { Controller, Post, Get, Patch, Body, Param, UseGuards, UsePipes } from '@nestjs/common';
 import { TodoService } from './todo.service';
-import { CreateListDto } from './dto/create-list.dto';
-import { CreateTodoDto } from './dto/create-todo.dto';
+import { CreateListDto, createListSchema } from './dto/create-list.dto';
+import { CreateTodoDto, createTodoSchema } from './dto/create-todo.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ParseBigIntPipe } from '../../common/pipes/parse-bigint.pipe';
+import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import { Role } from '@prisma/client';
 
 @Controller('api/v1/todos')
@@ -1398,6 +1379,7 @@ export class TodoController {
 
   @Post('lists')
   @Roles(Role.ADMIN, Role.CREATOR) // Only admins and creators can create lists
+  @UsePipes(new ZodValidationPipe(createListSchema))
   async createList(
     @Body() dto: CreateListDto,
     @CurrentUser('id') userId: bigint,
@@ -1419,6 +1401,7 @@ export class TodoController {
 
   @Post('lists/:listId/items')
   @Roles(Role.ADMIN, Role.CREATOR)
+  @UsePipes(new ZodValidationPipe(createTodoSchema))
   async createTodoItem(
     @Param('listId', ParseBigIntPipe) listId: bigint,
     @Body() dto: CreateTodoDto,
@@ -1590,24 +1573,26 @@ export class ParseJsonPipe implements PipeTransform {
 }
 ```
 
-Now use the custom pipe and `class-validator` DTOs inside your Controller:
+Now use the custom pipe, `ZodValidationPipe`, and Zod schema inside your Controller:
 
 ```typescript
 // src/modules/auth/client.controller.ts
-import { Controller, Post, UseInterceptors, UploadedFile, Body } from '@nestjs/common';
+import { Controller, Post, UseInterceptors, UploadedFile, Body, UsePipes } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ParseJsonPipe } from '../../common/pipes/parse-json.pipe';
-import { RegisterDto } from './dto/register.dto'; // Reuses RegisterDto validations
+import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
+import { RegisterDto, registerSchema } from './dto/register.dto'; // Reuses RegisterDto schemas
 
 @Controller('api/v1/clients')
 export class ClientController {
   @Post('create-client')
   @UseInterceptors(FileInterceptor('file')) // Intercept multipart 'file' field
+  @UsePipes(new ZodValidationPipe(registerSchema))
   async createClient(
     @UploadedFile() file: Express.Multer.File,
     @Body('data', ParseJsonPipe) clientDto: RegisterDto, // Parse & validate the 'data' form field automatically
   ) {
-    // clientDto is now a fully instantiated and validated RegisterDto object!
+    // clientDto is now a fully validated RegisterDto object!
     return {
       success: true,
       message: 'Client created successfully with upload.',
